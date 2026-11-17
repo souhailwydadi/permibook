@@ -3,8 +3,22 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import {
   DEFAULT_FORMATION_PRICES,
   DEFAULT_WORKING_HOURS,
+  getSuspension,
   slugify,
 } from "@/lib/school";
+import type { School } from "@/lib/types";
+
+/**
+ * Normalise a Moroccan phone number so 06.., +2126.., 2126.. and
+ * 06 12 34 56 78 all compare equal. Used to enforce one school per
+ * phone number (anti trial-abuse).
+ */
+function normalizePhone(raw: string): string {
+  const digits = raw.replace(/[\s.()\-]/g, "");
+  const noPlus = digits.startsWith("+") ? digits.slice(1) : digits;
+  if (noPlus.startsWith("212")) return "0" + noPlus.slice(3);
+  return noPlus;
+}
 
 /**
  * POST /api/auth/signup — create an owner account + their school.
@@ -27,6 +41,33 @@ export async function POST(req: NextRequest) {
   }
 
   const admin = createAdminClient();
+
+  // Anti-abuse: one school per phone number. Without this, a school whose
+  // trial expired (or was switched OFF by the super-admin) could simply
+  // re-register with a new email and get a fresh 14-day trial. The phone
+  // is required at signup and is much harder to rotate than an email.
+  // Checked BEFORE createUser so a rejected attempt creates nothing.
+  const normalizedPhone = normalizePhone(phone);
+  const { data: existingSchools } = await admin
+    .from("schools")
+    .select(
+      "id, name, status, plan, trial_ends_at, payment_status, paid_until, created_at, phone, whatsapp",
+    );
+  const clash = (existingSchools ?? []).find((s) => {
+    const phones = [s.phone, s.whatsapp].filter(Boolean) as string[];
+    return phones.some((p) => normalizePhone(p) === normalizedPhone);
+  });
+  if (clash) {
+    const suspended = getSuspension(clash as unknown as School).suspended;
+    return NextResponse.json(
+      {
+        error: suspended
+          ? "Ce numéro est déjà associé à une auto-école suspendue. Contactez Souhail pour réactiver votre compte."
+          : "Ce numéro est déjà enregistré. Connectez-vous avec votre compte existant.",
+      },
+      { status: 400 },
+    );
+  }
 
   const { data: created, error: createError } =
     await admin.auth.admin.createUser({
